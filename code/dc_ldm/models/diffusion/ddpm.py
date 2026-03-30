@@ -16,7 +16,10 @@ from contextlib import contextmanager
 from functools import partial
 from tqdm import tqdm
 from torchvision.utils import make_grid
-from pytorch_lightning.utilities.distributed import rank_zero_only
+try:
+    from pytorch_lightning.utilities.distributed import rank_zero_only
+except ImportError:
+    from pytorch_lightning.utilities.rank_zero import rank_zero_only
 
 from dc_ldm.util import log_txt_as_img, exists, default, ismap, isimage, mean_flat, count_params, instantiate_from_config
 from dc_ldm.modules.ema import LitEma
@@ -1044,9 +1047,13 @@ class LatentDiffusion(DDPM):
         x_recon = self.model(x_noisy, t, **cond)
 
         if isinstance(x_recon, tuple) and not return_ids:
-            return x_recon[0]
-        else:
-            return x_recon
+            x_recon = x_recon[0]
+
+        # Handle learn_sigma: DiT outputs 2*C channels (noise + variance), take only noise prediction
+        if x_recon.shape[1] != x_noisy.shape[1]:
+            x_recon = x_recon[:, :x_noisy.shape[1]]
+
+        return x_recon
 
     def _predict_eps_from_xstart(self, x_t, t, pred_xstart):
         return (extract_into_tensor(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t - pred_xstart) / \
@@ -1414,14 +1421,16 @@ class LatentDiffusion(DDPM):
         lr = self.learning_rate
         if self.train_cond_stage_only:
             print(f"{self.__class__.__name__}: Only optimizing conditioner params!")
-            cond_parms = [p for n, p in self.named_parameters() 
-                    if 'attn2' in n or 'time_embed_condtion' in n or 'norm2' in n]
-            # cond_parms = [p for n, p in self.named_parameters() 
-            #         if 'time_embed_condtion' in n]
-            # cond_parms = []
-            
+            # DiT-compatible: train cross-attention, adaLN modulation, time conditioning, and final layer
+            cond_parms = [p for n, p in self.named_parameters()
+                    if 'cross_attn' in n or 'norm_cross' in n
+                    or 'adaLN_modulation' in n or 'time_embed_condition' in n
+                    or 'final_layer' in n
+                    # Also support original UNet param names for backward compatibility
+                    or 'attn2' in n or 'time_embed_condtion' in n or 'norm2' in n]
+
             params = list(self.cond_stage_model.parameters()) + cond_parms
-        
+
             for p in params:
                 p.requires_grad = True
 

@@ -88,7 +88,7 @@ if __name__ == '__main__':
     config.kam_path = os.path.join(root, 'data/Kamitani/npz')
     config.bold5000_path = os.path.join(root, 'data/BOLD5000')
     config.pretrain_mbm_path = os.path.join(root, 'pretrains', f'{target}', 'fmri_encoder.pth')
-    config.pretrain_gm_path = os.path.join(root, 'pretrains/ldm/label2img')
+    config.pretrain_gm_path = os.path.join(root, 'pretrains/dit')
     print(config.__dict__)
 
     output_path = os.path.join(config.root_path, 'results', 'eval',  
