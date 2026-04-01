@@ -150,8 +150,9 @@ def main(config):
     pretrain_mbm_metafile = torch.load(config.pretrain_mbm_path, map_location='cpu')
     # create generateive model
     generative_model = fLDM(pretrain_mbm_metafile, num_voxels,
-                device=device, pretrain_root=config.pretrain_gm_path, logger=config.logger, 
-                ddim_steps=config.ddim_steps, global_pool=config.global_pool, use_time_cond=config.use_time_cond)
+                device=device, pretrain_root=config.pretrain_gm_path, logger=config.logger,
+                ddim_steps=config.ddim_steps, global_pool=config.global_pool, use_time_cond=config.use_time_cond,
+                backbone=config.backbone)
     
     # resume training if applicable
     if config.checkpoint_path is not None:
@@ -194,6 +195,9 @@ def get_args_parser():
     parser.add_argument('--ddim_steps', type=int)
     parser.add_argument('--use_time_cond', type=bool)
     parser.add_argument('--eval_avg', type=bool)
+    parser.add_argument('--backbone', type=str,
+                        choices=['unet', 'dit-adaln', 'dit-adaln-zero', 'dit-crossattn'],
+                        help='Denoising backbone: unet or dit-{adaln,adaln-zero,crossattn}')
 
     # # distributed training parameters
     # parser.add_argument('--local_rank', type=int)

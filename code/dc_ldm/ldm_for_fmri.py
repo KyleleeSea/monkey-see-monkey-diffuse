@@ -43,13 +43,182 @@ class cond_stage_model(nn.Module):
         out = latent_crossattn
         return out
 
+BACKBONE_CONFIG_MAP = {
+    'unet': 'config.yaml',
+    'dit-adaln': 'config_dit_adaln.yaml',
+    'dit-adaln-zero': 'config_dit_adaln_zero.yaml',
+    'dit-crossattn': 'config_dit_crossattn.yaml',
+}
+
+
+def _map_dit_pretrained_keys(pretrained_sd, block_type='adaLN-Zero'):
+    """Map official DiT checkpoint keys to our DiT module's naming convention.
+
+    Official DiT (Peebles & Xie) key structure:
+        x_embedder.proj.{weight,bias}      -> patch_embed.proj.{weight,bias}
+        t_embedder.mlp.{0,2}.{weight,bias} -> t_embedder.mlp.{0,2}.{weight,bias}  (same)
+        y_embedder.*                        -> SKIPPED (class-conditional, we use fMRI)
+        pos_embed                           -> pos_embed (same)
+        blocks.N.attn.qkv.{weight,bias}    -> blocks.N.attn.in_proj_{weight,bias}
+        blocks.N.attn.proj.{weight,bias}    -> blocks.N.attn.out_proj.{weight,bias}
+        blocks.N.mlp.fc1.{weight,bias}      -> blocks.N.ffn.0.{weight,bias}
+        blocks.N.mlp.fc2.{weight,bias}      -> blocks.N.ffn.3.{weight,bias}
+        blocks.N.adaLN_modulation.*         -> blocks.N.adaLN_modulation.* (same)
+        final_layer.*                       -> SKIPPED (out_channels mismatch: 8 vs 4)
+
+    For cross-attn blocks, self_attn is used instead of attn:
+        blocks.N.attn.qkv -> blocks.N.self_attn.in_proj_{weight,bias}
+        blocks.N.attn.proj -> blocks.N.self_attn.out_proj.{weight,bias}
+    """
+    mapped = {}
+    skipped = []
+
+    for k, v in pretrained_sd.items():
+        new_key = None
+
+        # Skip class-conditional embedding and final layer
+        if k.startswith('y_embedder.') or k.startswith('final_layer.'):
+            skipped.append(k)
+            continue
+
+        # Patch embedding
+        if k.startswith('x_embedder.'):
+            new_key = k.replace('x_embedder.', 'patch_embed.')
+
+        # Timestep embedding (already matches)
+        elif k.startswith('t_embedder.'):
+            new_key = k
+
+        # Positional embedding (already matches)
+        elif k == 'pos_embed':
+            new_key = k
+
+        # Transformer blocks
+        elif k.startswith('blocks.'):
+            parts = k.split('.', 2)  # ['blocks', 'N', 'rest']
+            block_idx = parts[1]
+            rest = parts[2]
+
+            # Attention: qkv -> in_proj, proj -> out_proj
+            if rest.startswith('attn.qkv.'):
+                param = rest.split('.')[-1]  # weight or bias
+                attn_name = 'self_attn' if block_type == 'cross-attn' else 'attn'
+                new_key = f'blocks.{block_idx}.{attn_name}.in_proj_{param}'
+            elif rest.startswith('attn.proj.'):
+                param_path = rest.replace('attn.proj.', '')
+                attn_name = 'self_attn' if block_type == 'cross-attn' else 'attn'
+                new_key = f'blocks.{block_idx}.{attn_name}.out_proj.{param_path}'
+
+            # MLP: fc1 -> ffn.0, fc2 -> ffn.3
+            elif rest.startswith('mlp.fc1.'):
+                param_path = rest.replace('mlp.fc1.', '')
+                new_key = f'blocks.{block_idx}.ffn.0.{param_path}'
+            elif rest.startswith('mlp.fc2.'):
+                param_path = rest.replace('mlp.fc2.', '')
+                new_key = f'blocks.{block_idx}.ffn.3.{param_path}'
+
+            # adaLN modulation (already matches)
+            elif rest.startswith('adaLN_modulation.'):
+                new_key = k
+            else:
+                skipped.append(k)
+                continue
+        else:
+            skipped.append(k)
+            continue
+
+        if new_key is not None:
+            mapped[new_key] = v
+
+    return mapped, skipped
+
+
+def _is_diffusers_vae_format(sd):
+    """Check if VAE state_dict uses diffusers naming (e.g. encoder.down_blocks)."""
+    return any(k.startswith('encoder.down_blocks.') or k.startswith('decoder.up_blocks.')
+               for k in sd.keys())
+
+
+def _convert_vae_diffusers_to_ldm(sd):
+    """Inline conversion of diffusers VAE keys to LDM format."""
+    import sys, importlib
+    # Import the converter from scripts/
+    script_dir = os.path.join(os.path.dirname(__file__), '..', '..', 'scripts')
+    sys.path.insert(0, os.path.abspath(script_dir))
+    from convert_vae_diffusers_to_ldm import convert_state_dict
+    sys.path.pop(0)
+    return convert_state_dict(sd)
+
+
+def _load_dit_pretrained(model, pretrain_root, block_type):
+    """Load pretrained SD-VAE and DiT weights into a LatentDiffusion model.
+
+    Expects:
+        pretrain_root/sd_vae.ckpt   - SD-VAE state_dict (diffusers or LDM format)
+        pretrain_root/dit_xl_2.pt   - Official DiT-XL/2 state_dict (EMA weights)
+    """
+    # 1. Load SD-VAE weights into first_stage_model
+    vae_path = os.path.join(pretrain_root, 'sd_vae.ckpt')
+    if os.path.exists(vae_path):
+        vae_sd = torch.load(vae_path, map_location='cpu')
+        # Handle different checkpoint formats
+        if isinstance(vae_sd, dict) and 'state_dict' in vae_sd:
+            vae_sd = vae_sd['state_dict']
+        # Auto-convert from diffusers format if needed
+        if _is_diffusers_vae_format(vae_sd):
+            print("SD-VAE: detected diffusers format, converting to LDM format...")
+            vae_sd = _convert_vae_diffusers_to_ldm(vae_sd)
+        m, u = model.first_stage_model.load_state_dict(vae_sd, strict=False)
+        print(f"SD-VAE: loaded from {vae_path} ({len(m)} missing, {len(u)} unexpected)")
+    else:
+        print(f"WARNING: SD-VAE checkpoint not found at {vae_path}. "
+              f"VAE will be randomly initialized.")
+
+    # 2. Load pretrained DiT weights into the diffusion model
+    dit_path = os.path.join(pretrain_root, 'dit_xl_2.pt')
+    if os.path.exists(dit_path):
+        dit_sd = torch.load(dit_path, map_location='cpu')
+        # Official pretrained checkpoints are raw state_dicts.
+        # Training checkpoints have 'ema' key.
+        if isinstance(dit_sd, dict) and 'ema' in dit_sd:
+            dit_sd = dit_sd['ema']
+
+        mapped_sd, skipped = _map_dit_pretrained_keys(dit_sd, block_type)
+
+        # Filter out keys with shape mismatches (e.g. adaLN has 4*D modulation
+        # but pretrained adaLN-Zero has 6*D). This avoids RuntimeError on load.
+        target_sd = model.model.diffusion_model.state_dict()
+        shape_mismatched = []
+        for k in list(mapped_sd.keys()):
+            if k in target_sd and mapped_sd[k].shape != target_sd[k].shape:
+                shape_mismatched.append(k)
+                del mapped_sd[k]
+
+        # Load into diffusion_model (inside DiffusionWrapper)
+        m, u = model.model.diffusion_model.load_state_dict(mapped_sd, strict=False)
+        n_loaded = len(mapped_sd) - len(u)
+        print(f"DiT pretrained: loaded {n_loaded}/{len(mapped_sd)} mapped weights, "
+              f"{len(m)} missing (new params), {len(skipped)} skipped (y_embedder/final_layer)")
+        if shape_mismatched:
+            print(f"  {len(shape_mismatched)} keys skipped due to shape mismatch "
+                  f"(e.g. adaLN modulation size differs from pretrained adaLN-Zero)")
+    else:
+        print(f"WARNING: DiT checkpoint not found at {dit_path}. "
+              f"DiT will be randomly initialized.")
+
+
 class fLDM:
 
     def __init__(self, metafile, num_voxels, device=torch.device('cpu'),
                  pretrain_root='../pretrains/ldm/label2img',
-                 logger=None, ddim_steps=250, global_pool=True, use_time_cond=True):
+                 logger=None, ddim_steps=250, global_pool=True, use_time_cond=True,
+                 backbone='unet'):
+        self.backbone = backbone
+        self.is_dit = backbone.startswith('dit')
+
+        config_filename = BACKBONE_CONFIG_MAP.get(backbone, 'config.yaml')
         self.ckp_path = os.path.join(pretrain_root, 'model.ckpt')
-        self.config_path = os.path.join(pretrain_root, 'config.yaml') 
+        self.config_path = os.path.join(pretrain_root, config_filename)
         config = OmegaConf.load(self.config_path)
         config.model.params.unet_config.params.use_time_cond = use_time_cond
         config.model.params.unet_config.params.global_pool = global_pool
@@ -57,9 +226,16 @@ class fLDM:
         self.cond_dim = config.model.params.unet_config.params.context_dim
 
         model = instantiate_from_config(config.model)
-        pl_sd = torch.load(self.ckp_path, map_location="cpu")['state_dict']
-       
-        m, u = model.load_state_dict(pl_sd, strict=False)
+
+        if self.is_dit:
+            # Load SD-VAE + pretrained DiT weights separately
+            block_type = config.model.params.unet_config.params.block_type
+            _load_dit_pretrained(model, pretrain_root, block_type)
+        else:
+            # Load original UNet + VQ-VAE checkpoint
+            pl_sd = torch.load(self.ckp_path, map_location="cpu")['state_dict']
+            m, u = model.load_state_dict(pl_sd, strict=False)
+
         model.cond_stage_trainable = True
         model.cond_stage_model = cond_stage_model(metafile, num_voxels, self.cond_dim, global_pool=global_pool)
 
@@ -108,7 +284,6 @@ class fLDM:
                 'model_state_dict': self.model.state_dict(),
                 'config': config,
                 'state': torch.random.get_rng_state()
-
             },
             os.path.join(output_path, 'checkpoint.pth')
         )

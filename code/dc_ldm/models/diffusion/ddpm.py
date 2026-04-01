@@ -1414,8 +1414,19 @@ class LatentDiffusion(DDPM):
         lr = self.learning_rate
         if self.train_cond_stage_only:
             print(f"{self.__class__.__name__}: Only optimizing conditioner params!")
-            cond_parms = [p for n, p in self.named_parameters() 
-                    if 'attn2' in n or 'time_embed_condtion' in n or 'norm2' in n]
+            # UNet conditioning interface layers:
+            #   attn2          -> cross-attention to fMRI context
+            #   time_embed_condtion -> fMRI pooled into timestep embedding
+            #   norm2          -> LayerNorm before cross-attention
+            # DiT conditioning interface layers (equivalent role):
+            #   adaLN_modulation -> MLP producing scale/shift/gate from conditioning vector
+            #   context_pooler   -> pools fMRI context into conditioning vector (= time_embed_condtion)
+            #   final_layer      -> zero-init output layer with its own adaLN modulation
+            #   cross_attn       -> cross-attention to fMRI (cross-attn block variant only)
+            cond_parms = [p for n, p in self.named_parameters()
+                    if 'attn2' in n or 'time_embed_condtion' in n or 'norm2' in n
+                    or 'adaLN_modulation' in n or 'context_pooler' in n
+                    or 'final_layer' in n or 'cross_attn' in n]
             # cond_parms = [p for n, p in self.named_parameters() 
             #         if 'time_embed_condtion' in n]
             # cond_parms = []

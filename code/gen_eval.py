@@ -117,9 +117,11 @@ if __name__ == '__main__':
     # prepare pretrained mae 
     pretrain_mbm_metafile = torch.load(config.pretrain_mbm_path, map_location='cpu')
     # create generateive model
+    backbone = getattr(config, 'backbone', 'unet')
     generative_model = fLDM(pretrain_mbm_metafile, num_voxels,
                 device=device, pretrain_root=config.pretrain_gm_path, logger=config.logger,
-                ddim_steps=config.ddim_steps, global_pool=config.global_pool, use_time_cond=config.use_time_cond)
+                ddim_steps=config.ddim_steps, global_pool=config.global_pool, use_time_cond=config.use_time_cond,
+                backbone=backbone)
     generative_model.model.load_state_dict(sd['model_state_dict'])
     print('load ldm successfully')
     state = sd['state']
