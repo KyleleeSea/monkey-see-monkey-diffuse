@@ -196,8 +196,8 @@ def get_args_parser():
     parser.add_argument('--use_time_cond', type=bool)
     parser.add_argument('--eval_avg', type=bool)
     parser.add_argument('--backbone', type=str,
-                        choices=['unet', 'dit-adaln', 'dit-adaln-zero', 'dit-crossattn'],
-                        help='Denoising backbone: unet or dit-{adaln,adaln-zero,crossattn}')
+                        choices=['unet', 'dit-adaln', 'dit-adaln-zero', 'dit-crossattn', 'uvit'],
+                        help='Denoising backbone: unet, dit-{adaln,adaln-zero,crossattn}, or uvit')
 
     # # distributed training parameters
     # parser.add_argument('--local_rank', type=int)

@@ -113,7 +113,7 @@ class Config_Generative_Model:
         self.use_time_cond = True
         self.eval_avg = True
 
-        # backbone selection: 'unet', 'dit-adaln', 'dit-adaln-zero', 'dit-crossattn'
+        # backbone selection: 'unet', 'dit-adaln', 'dit-adaln-zero', 'dit-crossattn', 'uvit'
         self.backbone = 'unet'
 
         # diffusion sampling parameters

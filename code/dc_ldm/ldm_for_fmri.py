@@ -48,6 +48,7 @@ BACKBONE_CONFIG_MAP = {
     'dit-adaln': 'config_dit_adaln.yaml',
     'dit-adaln-zero': 'config_dit_adaln_zero.yaml',
     'dit-crossattn': 'config_dit_crossattn.yaml',
+    'uvit': 'config_uvit.yaml',
 }
 
 
@@ -207,6 +208,79 @@ def _load_dit_pretrained(model, pretrain_root, block_type):
               f"DiT will be randomly initialized.")
 
 
+def _load_uvit_pretrained(model, pretrain_root):
+    """Load pretrained SD-VAE and U-ViT-H/2 weights into a LatentDiffusion model.
+
+    Expects:
+        pretrain_root/sd_vae.ckpt              - SD-VAE state_dict
+        pretrain_root/uvit_h2_imagenet256.pth   - U-ViT-H/2 ImageNet 256x256 checkpoint
+    """
+    # 1. Load SD-VAE weights (same as DiT)
+    vae_path = os.path.join(pretrain_root, 'sd_vae.ckpt')
+    if os.path.exists(vae_path):
+        vae_sd = torch.load(vae_path, map_location='cpu')
+        if isinstance(vae_sd, dict) and 'state_dict' in vae_sd:
+            vae_sd = vae_sd['state_dict']
+        if _is_diffusers_vae_format(vae_sd):
+            print("SD-VAE: detected diffusers format, converting to LDM format...")
+            vae_sd = _convert_vae_diffusers_to_ldm(vae_sd)
+        m, u = model.first_stage_model.load_state_dict(vae_sd, strict=False)
+        print(f"SD-VAE: loaded from {vae_path} ({len(m)} missing, {len(u)} unexpected)")
+    else:
+        print(f"WARNING: SD-VAE checkpoint not found at {vae_path}. "
+              f"VAE will be randomly initialized.")
+
+    # 2. Load pretrained U-ViT weights
+    uvit_path = os.path.join(pretrain_root, 'uvit_h2_imagenet256.pth')
+    if os.path.exists(uvit_path):
+        uvit_sd = torch.load(uvit_path, map_location='cpu')
+
+        # Skip class label embedding (we replace it with fMRI conditioning)
+        skipped = [k for k in uvit_sd if k.startswith('label_emb.')]
+        mapped_sd = {k: v for k, v in uvit_sd.items()
+                     if not k.startswith('label_emb.')}
+
+        # Handle pos_embed shape mismatch
+        # Pretrained: (1, 258, 1152) = (1, 2 + 256, 1152) where 2 = time + class label
+        # Our model: (1, 258, 1152) = (1, 2 + 256, 1152) where 2 = time + fMRI pooled
+        # Shapes match when using pooled fMRI (extras=2), so pos_embed loads directly.
+        # If shapes ever differ, handle it here:
+        if 'pos_embed' in mapped_sd:
+            pretrained_pos = mapped_sd['pos_embed']
+            target_pos = model.model.diffusion_model.pos_embed
+            if pretrained_pos.shape != target_pos.shape:
+                print(f"U-ViT: pos_embed shape mismatch: pretrained {pretrained_pos.shape} "
+                      f"vs target {target_pos.shape}. Adapting...")
+                new_pos = torch.zeros_like(target_pos)
+                # Keep time token pos (index 0) and patch token pos (last 256)
+                new_pos[:, 0, :] = pretrained_pos[:, 0, :]        # time token
+                n_patches = min(pretrained_pos.shape[1] - 2, target_pos.shape[1] - 2)
+                new_pos[:, -n_patches:, :] = pretrained_pos[:, -n_patches:, :]  # patch tokens
+                # Initialize fMRI token positions (between time and patches) randomly
+                n_fmri = target_pos.shape[1] - 1 - n_patches
+                if n_fmri > 0:
+                    nn.init.trunc_normal_(new_pos[:, 1:1+n_fmri, :], std=0.02)
+                mapped_sd['pos_embed'] = new_pos
+
+        # Filter out any remaining shape mismatches
+        target_sd = model.model.diffusion_model.state_dict()
+        shape_mismatched = []
+        for k in list(mapped_sd.keys()):
+            if k in target_sd and mapped_sd[k].shape != target_sd[k].shape:
+                shape_mismatched.append(k)
+                del mapped_sd[k]
+
+        m, u = model.model.diffusion_model.load_state_dict(mapped_sd, strict=False)
+        n_loaded = len(mapped_sd) - len(u)
+        print(f"U-ViT pretrained: loaded {n_loaded}/{len(mapped_sd)} mapped weights, "
+              f"{len(m)} missing (new fMRI params), {len(skipped)} skipped (label_emb)")
+        if shape_mismatched:
+            print(f"  {len(shape_mismatched)} keys skipped due to shape mismatch")
+    else:
+        print(f"WARNING: U-ViT checkpoint not found at {uvit_path}. "
+              f"U-ViT will be randomly initialized.")
+
+
 class fLDM:
 
     def __init__(self, metafile, num_voxels, device=torch.device('cpu'),
@@ -215,6 +289,7 @@ class fLDM:
                  backbone='unet'):
         self.backbone = backbone
         self.is_dit = backbone.startswith('dit')
+        self.is_uvit = backbone == 'uvit'
 
         config_filename = BACKBONE_CONFIG_MAP.get(backbone, 'config.yaml')
         self.ckp_path = os.path.join(pretrain_root, 'model.ckpt')
@@ -231,6 +306,9 @@ class fLDM:
             # Load SD-VAE + pretrained DiT weights separately
             block_type = config.model.params.unet_config.params.block_type
             _load_dit_pretrained(model, pretrain_root, block_type)
+        elif self.is_uvit:
+            # Load SD-VAE + pretrained U-ViT weights separately
+            _load_uvit_pretrained(model, pretrain_root)
         else:
             # Load original UNet + VQ-VAE checkpoint
             pl_sd = torch.load(self.ckp_path, map_location="cpu")['state_dict']

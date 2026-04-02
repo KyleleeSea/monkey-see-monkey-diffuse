@@ -1426,7 +1426,8 @@ class LatentDiffusion(DDPM):
             cond_parms = [p for n, p in self.named_parameters()
                     if 'attn2' in n or 'time_embed_condtion' in n or 'norm2' in n
                     or 'adaLN_modulation' in n or 'context_pooler' in n
-                    or 'final_layer' in n or 'cross_attn' in n]
+                    or 'final_layer' in n or 'cross_attn' in n
+                    or 'context_proj' in n or 'context_pool' in n]
             # cond_parms = [p for n, p in self.named_parameters() 
             #         if 'time_embed_condtion' in n]
             # cond_parms = []
