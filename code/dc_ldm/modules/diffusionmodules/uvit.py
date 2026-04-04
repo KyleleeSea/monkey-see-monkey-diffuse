@@ -86,9 +86,13 @@ class Attention(nn.Module):
         qkv = qkv.permute(2, 0, 3, 1, 4)  # (3, B, heads, L, head_dim)
         q, k, v = qkv.unbind(0)
 
-        # Use PyTorch's native scaled_dot_product_attention
-        # (automatically selects flash / memory-efficient / math backend)
-        x = F.scaled_dot_product_attention(q, k, v)
+        if hasattr(F, 'scaled_dot_product_attention'):
+            x = F.scaled_dot_product_attention(q, k, v)
+        else:
+            # Fallback for PyTorch < 2.0
+            attn = (q @ k.transpose(-2, -1)) * self.scale
+            attn = attn.softmax(dim=-1)
+            x = attn @ v
 
         x = x.transpose(1, 2).reshape(B, L, C)
         x = self.proj(x)
