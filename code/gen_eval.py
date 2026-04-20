@@ -63,6 +63,16 @@ def get_eval_metric(samples, avg=True):
     res_list.append(np.max(res_part))
     metric_list.append('top-1-class')
     metric_list.append('top-1-class (max)')
+
+    fid = fid_wrapper()
+    fid_scores = []
+    for s in samples_to_run:
+        pred_images = [img[s] for img in samples]
+        pred_images = rearrange(np.stack(pred_images), 'n c h w -> n h w c')
+        fid_scores.append(fid(pred_images.astype(np.uint8), gt_images.astype(np.uint8)))
+    res_list.append(np.mean(fid_scores))
+    metric_list.append('fid')
+
     return res_list, metric_list
 
 def get_args_parser():
@@ -135,7 +145,8 @@ if __name__ == '__main__':
     wandb_init(config)
     wandb.log({f'summary/samples_test': wandb.Image(grid_imgs)})
     metric, metric_list = get_eval_metric(samples, avg=True)
-    metric_dict = {f'summary/pair-wise_{k}':v for k, v in zip(metric_list[:-2], metric[:-2])}
+    metric_dict = {f'summary/pair-wise_{k}':v for k, v in zip(metric_list[:-3], metric[:-3])}
+    metric_dict[f'summary/{metric_list[-3]}'] = metric[-3]
     metric_dict[f'summary/{metric_list[-2]}'] = metric[-2]
     metric_dict[f'summary/{metric_list[-1]}'] = metric[-1]
     print(metric_dict)

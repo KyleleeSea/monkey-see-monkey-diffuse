@@ -27,7 +27,7 @@ from dc_ldm.models.diffusion.ddim import DDIMSampler
 from dc_ldm.models.diffusion.plms import PLMSSampler
 from PIL import Image
 import torch.nn.functional as F
-from eval_metrics import get_similarity_metric
+from eval_metrics import get_similarity_metric, fid_wrapper
 
 __conditioning_keys__ = {'concat': 'c_concat',
                          'crossattn': 'c_crossattn',
@@ -441,12 +441,13 @@ class DDPM(pl.LightningModule):
         print('###### run full validation! ######\n')
         grid, all_samples, state = self.generate(batch, ddim_steps=self.ddim_steps, num_samples=5, limit=None, state=state)
         metric, metric_list = self.get_eval_metric(all_samples)
-        self.save_images(all_samples, suffix='%.4f'%metric[-1])
+        top1_max = metric[metric_list.index('top-1-class (max)')]
+        self.save_images(all_samples, suffix='%.4f'%top1_max)
         metric_dict = {f'val/{k}_full':v for k, v in zip(metric_list, metric)}
         self.logger.log_metrics(metric_dict)
         grid_imgs = Image.fromarray(grid.astype(np.uint8))
         self.logger.log_image(key=f'samples_test_full', images=[grid_imgs])
-        if metric[-1] > self.best_val:
+        if top1_max > self.best_val:
             self.best_val = metric[-1]
             torch.save(
                 {
@@ -503,7 +504,16 @@ class DDPM(pl.LightningModule):
         metric_list.append('top-1-class')
         metric_list.append('top-1-class (max)')
 
-        return res_list, metric_list    
+        fid = fid_wrapper()
+        fid_scores = []
+        for s in samples_to_run:
+            pred_images = [img[s] for img in samples]
+            pred_images = rearrange(np.stack(pred_images), 'n c h w -> n h w c')
+            fid_scores.append(fid(pred_images.astype(np.uint8), gt_images.astype(np.uint8)))
+        res_list.append(np.mean(fid_scores))
+        metric_list.append('fid')
+
+        return res_list, metric_list
 
     def on_train_batch_end(self, *args, **kwargs):
         if self.use_ema:

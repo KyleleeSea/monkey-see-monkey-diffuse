@@ -9,46 +9,39 @@ model:
     timesteps: 1000
     first_stage_key: image
     cond_stage_key: fmri
-    image_size: 64
-    channels: 3
+    image_size: 32
+    channels: 4
     cond_stage_trainable: true
     conditioning_key: crossattn
     monitor: val/loss
     use_ema: False
-    
+    scale_factor: 0.18215
+
     unet_config:
-      target: dc_ldm.modules.diffusionmodules.openaimodel.UNetModel
+      target: dc_ldm.modules.diffusionmodules.pixart.PixArtForFMRI
       params:
-        image_size: 64
-        in_channels: 3
-        out_channels: 3
-        model_channels: 192
-        attention_resolutions:
-        - 8
-        - 4
-        - 2
-        num_res_blocks: 2
-        channel_mult:
-        - 1
-        - 2
-        - 3
-        - 5
-        num_heads: 1
-        use_spatial_transformer: true
-        transformer_depth: 1
+        image_size: 32
+        patch_size: 2
+        in_channels: 4
+        out_channels: 4
+        hidden_size: 1152
+        depth: 28
+        num_heads: 16
+        mlp_ratio: 4.0
         context_dim: 512
-        cond_scale: 1.0
+        block_type: adaLN-single
         use_time_cond: true
         global_pool: false
-    
+        dropout: 0.0
+        use_checkpoint: false
+
     first_stage_config:
-      target: dc_ldm.models.autoencoder.VQModelInterface
+      target: dc_ldm.models.autoencoder.AutoencoderKL
       params:
-        embed_dim: 3
-        n_embed: 8192
+        embed_dim: 4
         ddconfig:
-          double_z: false
-          z_channels: 3
+          double_z: true
+          z_channels: 4
           resolution: 256
           in_channels: 3
           out_ch: 3
@@ -57,12 +50,13 @@ model:
           - 1
           - 2
           - 4
+          - 4
           num_res_blocks: 2
           attn_resolutions: []
           dropout: 0.0
         lossconfig:
           target: torch.nn.Identity
-    
+
     cond_stage_config:
       target: dc_ldm.modules.encoders.modules.ClassEmbedder
       params:

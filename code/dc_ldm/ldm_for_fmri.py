@@ -49,6 +49,10 @@ BACKBONE_CONFIG_MAP = {
     'dit-adaln-zero': 'config_dit_adaln_zero.yaml',
     'dit-crossattn': 'config_dit_crossattn.yaml',
     'uvit': 'config_uvit.yaml',
+    'pixart-adaln-single': 'config_pixart_adaln_single.yaml',
+    'pixart-adaln-single-nocross': 'config_pixart_adaln_single_nocross.yaml',
+    'pixart-adaln-zero': 'config_pixart_adaln_zero.yaml',
+    'pixart-full': 'config_pixart_full.yaml',
 }
 
 
@@ -281,6 +285,100 @@ def _load_uvit_pretrained(model, pretrain_root):
               f"U-ViT will be randomly initialized.")
 
 
+def _map_pixart_pretrained_keys(pretrained_sd):
+    """Map official PixArt-alpha checkpoint keys to our PixArtForFMRI naming.
+
+    Official PixArt-alpha key structure:
+        x_embedder.*            -> x_embedder.*  (same)
+        t_embedder.*            -> t_embedder.*  (same)
+        t_block.*               -> t_block.*     (same)
+        y_embedder.*            -> SKIPPED (T5 caption embedder, replaced by fMRI projection)
+        pos_embed               -> pos_embed     (same)
+        blocks.N.attn.*         -> blocks.N.attn.*  (self-attention, needs qkv remapping)
+        blocks.N.cross_attn.*   -> SKIPPED (shape mismatch: 4096 vs 512 context_dim)
+        blocks.N.norm1/norm2.*  -> blocks.N.norm1/norm2.* (same)
+        blocks.N.mlp.*          -> blocks.N.mlp.* (needs fc1/fc2 remapping)
+        blocks.N.scale_shift_table -> blocks.N.scale_shift_table (same)
+        final_layer.*           -> final_layer.* (same if out_channels match)
+    """
+    mapped = {}
+    skipped = []
+
+    for k, v in pretrained_sd.items():
+        # Skip caption embedder (T5-conditioned, we use fMRI)
+        if k.startswith('y_embedder.'):
+            skipped.append(k)
+            continue
+
+        # Skip cross-attention (shape mismatch: 4096 vs 512 context_dim)
+        if '.cross_attn.' in k:
+            skipped.append(k)
+            continue
+
+        # Self-attention: PixArt uses timm-style qkv, our SelfAttention also uses qkv
+        # PixArt: blocks.N.attn.qkv.{weight,bias} -> blocks.N.attn.qkv.{weight,bias}
+        # PixArt: blocks.N.attn.proj.{weight,bias} -> blocks.N.attn.proj.{weight,bias}
+        # These match our SelfAttention naming directly.
+
+        # MLP: PixArt uses timm Mlp with fc1/fc2, our Mlp also has fc1/fc2
+        # These match directly.
+
+        # Everything else maps as-is
+        mapped[k] = v
+
+    return mapped, skipped
+
+
+def _load_pixart_pretrained(model, pretrain_root, block_type):
+    """Load pretrained SD-VAE and PixArt-alpha weights into a LatentDiffusion model.
+
+    Expects:
+        pretrain_root/sd_vae.ckpt       - SD-VAE state_dict (diffusers or LDM format)
+        pretrain_root/pixart_xl_2.pth   - Official PixArt-alpha XL/2 state_dict
+    """
+    # 1. Load SD-VAE weights into first_stage_model
+    vae_path = os.path.join(pretrain_root, 'sd_vae.ckpt')
+    if os.path.exists(vae_path):
+        vae_sd = torch.load(vae_path, map_location='cpu')
+        if isinstance(vae_sd, dict) and 'state_dict' in vae_sd:
+            vae_sd = vae_sd['state_dict']
+        if _is_diffusers_vae_format(vae_sd):
+            print("SD-VAE: detected diffusers format, converting to LDM format...")
+            vae_sd = _convert_vae_diffusers_to_ldm(vae_sd)
+        m, u = model.first_stage_model.load_state_dict(vae_sd, strict=False)
+        print(f"SD-VAE: loaded from {vae_path} ({len(m)} missing, {len(u)} unexpected)")
+    else:
+        print(f"WARNING: SD-VAE checkpoint not found at {vae_path}. "
+              f"VAE will be randomly initialized.")
+
+    # 2. Load pretrained PixArt-alpha weights into the diffusion model
+    pixart_path = os.path.join(pretrain_root, 'PixArt-XL-2-256x256.pth')
+    if os.path.exists(pixart_path):
+        pixart_sd = torch.load(pixart_path, map_location='cpu')
+        if isinstance(pixart_sd, dict) and 'state_dict' in pixart_sd:
+            pixart_sd = pixart_sd['state_dict']
+
+        mapped_sd, skipped = _map_pixart_pretrained_keys(pixart_sd)
+
+        # Filter out keys with shape mismatches
+        target_sd = model.model.diffusion_model.state_dict()
+        shape_mismatched = []
+        for k in list(mapped_sd.keys()):
+            if k in target_sd and mapped_sd[k].shape != target_sd[k].shape:
+                shape_mismatched.append(k)
+                del mapped_sd[k]
+
+        m, u = model.model.diffusion_model.load_state_dict(mapped_sd, strict=False)
+        n_loaded = len(mapped_sd) - len(u)
+        print(f"PixArt pretrained: loaded {n_loaded}/{len(mapped_sd)} mapped weights, "
+              f"{len(m)} missing (new params), {len(skipped)} skipped (y_embedder/cross_attn)")
+        if shape_mismatched:
+            print(f"  {len(shape_mismatched)} keys skipped due to shape mismatch")
+    else:
+        print(f"WARNING: PixArt checkpoint not found at {pixart_path}. "
+              f"PixArt will be randomly initialized.")
+
+
 class fLDM:
 
     def __init__(self, metafile, num_voxels, device=torch.device('cpu'),
@@ -290,6 +388,7 @@ class fLDM:
         self.backbone = backbone
         self.is_dit = backbone.startswith('dit')
         self.is_uvit = backbone == 'uvit'
+        self.is_pixart = backbone.startswith('pixart')
 
         config_filename = BACKBONE_CONFIG_MAP.get(backbone, 'config.yaml')
         self.ckp_path = os.path.join(pretrain_root, 'model.ckpt')
@@ -302,7 +401,11 @@ class fLDM:
 
         model = instantiate_from_config(config.model)
 
-        if self.is_dit:
+        if self.is_pixart:
+            # Load SD-VAE + pretrained PixArt weights separately
+            block_type = config.model.params.unet_config.params.block_type
+            _load_pixart_pretrained(model, pretrain_root, block_type)
+        elif self.is_dit:
             # Load SD-VAE + pretrained DiT weights separately
             block_type = config.model.params.unet_config.params.block_type
             _load_dit_pretrained(model, pretrain_root, block_type)
